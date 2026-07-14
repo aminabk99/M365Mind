@@ -1,16 +1,13 @@
 """
 Generation module for M365Mind.
 
-Uses microsoft/Phi-3.5-mini-instruct via HuggingFace transformers.
-No Ollama required — model downloads automatically on first use.
+Uses Qwen/Qwen2.5-1.5B-Instruct via HuggingFace transformers.
+~3 GB download, fast on CPU (10-25 s per response), no GPU required.
 
-Hardware notes
---------------
-- GPU (8 GB+ VRAM): fast, bfloat16, recommended
-- CPU only: works, ~60-120 s per response, float32
-- Apple Silicon: MPS backend used automatically via device_map="auto"
+For GPU users: swap MODEL_ID to "microsoft/Phi-3.5-mini-instruct" for
+higher quality at the cost of a 7.6 GB download and GPU VRAM.
 
-Model cache: ~/.cache/huggingface (~7.6 GB on first download)
+Model cache: ~/.cache/huggingface
 """
 
 from __future__ import annotations
@@ -20,7 +17,7 @@ from functools import lru_cache
 
 logger = logging.getLogger(__name__)
 
-MODEL_ID = "microsoft/Phi-3.5-mini-instruct"
+MODEL_ID = "Qwen/Qwen2.5-1.5B-Instruct"
 MAX_NEW_TOKENS = 512
 
 

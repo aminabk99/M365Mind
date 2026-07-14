@@ -239,12 +239,20 @@ def get_auth_url() -> str | None:
 
 def load_demo_data() -> dict | None:
     try:
-        r = httpx.post(f"{BACKEND_URL}/demo/load", timeout=120)
+        r = httpx.post(f"{BACKEND_URL}/demo/load", timeout=300)
         r.raise_for_status()
         return r.json()
     except Exception as exc:
         st.error(f"Demo load failed: {exc}")
         return None
+
+
+def demo_already_loaded() -> bool:
+    try:
+        r = api_get("/demo/status")
+        return r.json().get("demo_loaded", False)
+    except Exception:
+        return False
 
 
 def sync_tenant(sid: str) -> dict | None:
@@ -375,15 +383,21 @@ if st.session_state.mode is None:
             "Sensitivity Labels, Named Locations. No Microsoft account needed."
         )
         if st.button("Launch Demo", type="secondary", use_container_width=True):
-            with st.spinner("Loading sample policies…"):
-                result = load_demo_data()
-            if result:
+            if demo_already_loaded():
                 st.session_state.mode = "demo"
                 st.session_state.demo_loaded = True
-                st.session_state.policies_info = [
-                    {"filename": f"Demo policies ({result['loaded']} loaded)"}
-                ]
+                st.session_state.policies_info = [{"filename": "Demo policies (17 loaded)"}]
                 st.rerun()
+            else:
+                with st.spinner("Loading sample policies… (first run downloads embedding model, ~1 min)"):
+                    result = load_demo_data()
+                if result:
+                    st.session_state.mode = "demo"
+                    st.session_state.demo_loaded = True
+                    st.session_state.policies_info = [
+                        {"filename": f"Demo policies ({result['loaded']} loaded)"}
+                    ]
+                    st.rerun()
 
     with col_connect:
         st.markdown("##### 🏢 Connect to Microsoft 365")
