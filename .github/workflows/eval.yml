@@ -24,12 +24,9 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # The cross-encoder model is downloaded on first use.
-      # In quick mode the LLM is mocked, but the reranker would still try
-      # to download. We skip model download in quick mode by setting an env var.
-      - name: Run quick eval (mocked LLM + mocked reranker)
+      - name: Run quick eval (mocked LLM)
         env:
-          DOCMIND_SKIP_RERANKER: "1"   # reranker.py checks this and falls back
+          DOCMIND_SKIP_RERANKER: "1"
           CHROMA_DB_PATH: /tmp/chroma_test
         run: python -m eval.run_evals --quick --output eval_results.json
 
@@ -41,9 +38,8 @@ jobs:
           path: eval_results.json
 
   eval-full:
-    name: Full eval (with Ollama)
+    name: Full eval with auto-generated cases (Ollama)
     runs-on: ubuntu-latest
-    # Only run on pushes to main (not every PR) — Ollama is slow on shared runners
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
 
     steps:
@@ -78,19 +74,33 @@ jobs:
           uvicorn backend.main:app --host 0.0.0.0 --port 8000 &
           sleep 3
 
-      - name: Upload fixture PDF
+      - name: Upload fixture PDF and ingest
         run: |
           curl -s -F "file=@tests/fixtures/sample.pdf" http://localhost:8000/upload
           sleep 2
 
-      - name: Run full eval
+      - name: Auto-generate eval cases from ingested docs
         env:
           CHROMA_DB_PATH: /tmp/chroma_eval
-        run: python -m eval.run_evals --full --backend-url http://localhost:8000 --output eval_results_full.json
+          OLLAMA_BASE_URL: http://localhost:11434
+        run: python -m eval.generate_cases --max-cases 10
 
-      - name: Upload eval results
+      - name: Run full eval with LLM judge
+        env:
+          CHROMA_DB_PATH: /tmp/chroma_eval
+          OLLAMA_BASE_URL: http://localhost:11434
+        run: |
+          python -m eval.run_evals \
+            --full \
+            --backend-url http://localhost:8000 \
+            --commit ${{ github.sha }} \
+            --output eval_results_full.json
+
+      - name: Upload eval results + score history
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: eval-results-full
-          path: eval_results_full.json
+          path: |
+            eval_results_full.json
+            eval/scores_history.jsonl

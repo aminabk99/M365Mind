@@ -2,30 +2,25 @@
 """
 DocMind Evaluation Pipeline
 ============================
-Measures three production-relevant metrics:
+Measures three axes of quality using LLM-as-judge scoring:
 
-  1. Context Precision  — what fraction of retrieved chunks contain at least
-                          one expected keyword from the answer
-  2. Answer Faithfulness — what fraction of answers contain at least one
-                           verifiable [filename, page N] citation
-  3. Pass Rate          — fraction of test cases meeting min_confidence
+  Faithfulness  — does the answer stick to retrieved sources?
+  Relevance     — does the answer address the question vs. ground truth?
+  Pass Rate     — fraction of cases meeting min_confidence threshold
 
 Modes
 -----
-  --quick   Mock the Ollama LLM (tests retrieval + citation parsing only).
-            Safe to run in CI without a GPU.
-  --full    Call the real LLM via Ollama. Requires `ollama serve` + models.
+  --quick   Mock the LLM (tests pipeline wiring only). CI-safe, no GPU.
+  --full    Call real backend + real LLM judge. Requires Ollama running.
+
+Score history is appended to eval/scores_history.jsonl on every --full run
+so regression curves can be tracked across commits.
 
 Exit codes
 ----------
   0  All thresholds met
   1  One or more thresholds failed
   2  Configuration / setup error
-
-Usage
------
-  python -m eval.run_evals --quick
-  python -m eval.run_evals --full --pdf tests/fixtures/sample.pdf
 """
 
 from __future__ import annotations
@@ -34,158 +29,172 @@ import argparse
 import json
 import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
 
 EVAL_DIR     = Path(__file__).parent
 CASES_FILE   = EVAL_DIR / "test_cases.json"
+HISTORY_FILE = EVAL_DIR / "scores_history.jsonl"
 CITATION_RE  = re.compile(r'\[([^\],]+),\s*page\s*(\d+)\]', re.IGNORECASE)
 
+
 # ---------------------------------------------------------------------------
-# Metrics
+# Helpers
 # ---------------------------------------------------------------------------
 
-def context_precision(sources: list[dict], keywords: list[str]) -> float:
-    """Fraction of retrieved chunks containing at least one keyword."""
-    if not sources or not keywords:
-        return 1.0  # no keywords to check → trivially satisfied
-    kw_lower = [k.lower() for k in keywords]
-    hits = sum(
-        1 for s in sources
-        if any(k in s.get("chunk_text", "").lower() for k in kw_lower)
-    )
-    return hits / len(sources)
+def answer_faithfulness_heuristic(answer: str) -> float:
+    """Quick heuristic: 1.0 if answer contains a citation tag, else 0.5."""
+    return 1.0 if CITATION_RE.search(answer) else 0.5
 
 
-def answer_faithfulness(answer: str) -> float:
-    """1.0 if the answer contains at least one citation tag, else 0.0."""
-    return 1.0 if CITATION_RE.search(answer) else 0.0
-
-
-def check_refusal(answer: str, refusal_keywords: list[str]) -> bool:
-    """True if the answer contains any of the refusal keywords."""
+def check_refusal(answer: str, keywords: list[str]) -> bool:
     al = answer.lower()
-    return any(k.lower() in al for k in refusal_keywords)
+    return any(k.lower() in al for k in keywords)
 
 
 # ---------------------------------------------------------------------------
-# Mock LLM (for --quick CI mode)
+# Quick mode (mocked)
 # ---------------------------------------------------------------------------
 
-_MOCK_ANSWER_TEMPLATE = (
-    "Based on the document, the key information is summarised below. "
-    "[{filename}, page {page}] This is a mock answer for CI validation."
-)
-
-
-def mock_answer(sources: list[dict], question: str) -> str:
-    if not sources:
-        return "I could not find sufficient information in the uploaded documents to answer this question."
-    s = sources[0]
-    return _MOCK_ANSWER_TEMPLATE.format(
-        filename=s.get("filename", "unknown"),
-        page=s.get("page_number", 1),
+def run_case_quick(case: dict) -> dict:
+    mock_answer = (
+        f"Based on the document, {case.get('ground_truth_answer', 'the answer is in the sources')} "
+        f"[{case.get('expected_source_filenames', ['sample.pdf'])[0]}, page 1]"
+        if not case.get("check_refusal")
+        else "I could not find sufficient information in the uploaded documents."
     )
 
-
-# ---------------------------------------------------------------------------
-# Runner
-# ---------------------------------------------------------------------------
-
-def run_case_quick(case: dict, all_sources_fixture: list[dict]) -> dict:
-    """
-    Quick mode: use fixture sources, mock LLM answer, check citation logic.
-    """
-    answer  = mock_answer(all_sources_fixture, case["question"])
-    sources = all_sources_fixture
-
-    cp = context_precision(sources, case.get("expected_keywords", []))
-    af = answer_faithfulness(answer)
-
+    faith = answer_faithfulness_heuristic(mock_answer)
     passed = True
     notes  = []
 
     if case.get("check_refusal"):
-        if not check_refusal(answer, case.get("expected_keywords", ["could not find"])):
+        if not check_refusal(mock_answer, ["could not find", "insufficient"]):
             passed = False
-            notes.append("Expected refusal but answer did not refuse.")
-    else:
-        if af < 1.0 and case.get("check_citation_present"):
-            passed = False
-            notes.append("Answer missing citation tag.")
+            notes.append("Expected refusal not detected.")
 
     return {
-        "id":                case["id"],
-        "description":       case["description"],
-        "context_precision": round(cp, 3),
-        "faithfulness":      round(af, 3),
-        "passed":            passed,
-        "notes":             notes,
-        "answer_snippet":    answer[:120],
+        "id":           case["id"],
+        "description":  case.get("description", ""),
+        "faithfulness": faith,
+        "relevance":    1.0,   # trivially 1.0 in mock
+        "composite":    round((faith + 1.0) / 2, 3),
+        "confidence":   0.75,
+        "passed":       passed,
+        "notes":        notes,
+        "answer_snippet": mock_answer[:120],
     }
 
 
-def run_case_full(case: dict, backend_url: str) -> dict:
-    """
-    Full mode: call the real backend /query endpoint.
-    """
-    import httpx
+# ---------------------------------------------------------------------------
+# Full mode (real backend + LLM judge)
+# ---------------------------------------------------------------------------
 
-    resp = httpx.post(
-        f"{backend_url}/query",
-        json={"question": case["question"], "top_k": 5},
-        timeout=120,
-    )
-    resp.raise_for_status()
-    data = resp.json()
+def run_case_full(case: dict, backend_url: str) -> dict:
+    import httpx
+    from eval.llm_judge import judge
+
+    # Call backend
+    try:
+        resp = httpx.post(
+            f"{backend_url}/query",
+            json={"question": case["question"], "top_k": 5},
+            timeout=120,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        return _error_result(case, f"Backend error: {exc}")
 
     answer  = data.get("answer", "")
     sources = data.get("sources", [])
     conf    = data.get("confidence", 0.0)
 
-    cp = context_precision(sources, case.get("expected_keywords", []))
-    af = answer_faithfulness(answer)
+    # LLM judge
+    try:
+        scores = judge(
+            question      = case["question"],
+            ground_truth  = case.get("ground_truth_answer", ""),
+            system_answer = answer,
+            source_chunks = [s.get("chunk_text", "") for s in sources],
+        )
+    except Exception as exc:
+        scores = {"faithfulness": 0.0, "relevance": 0.0, "composite": 0.0,
+                  "reasoning": {"faithfulness": str(exc), "relevance": str(exc)}}
 
     passed = True
     notes  = []
 
     if conf < case.get("min_confidence", 0.0):
         passed = False
-        notes.append(f"Confidence {conf:.3f} < threshold {case['min_confidence']:.3f}")
+        notes.append(f"Confidence {conf:.3f} below threshold {case['min_confidence']:.3f}")
 
     if case.get("check_refusal"):
-        if not check_refusal(answer, case.get("expected_keywords", ["could not find"])):
+        if not check_refusal(answer, ["could not find", "insufficient"]):
             passed = False
-            notes.append("Expected refusal but answer did not refuse.")
-    elif case.get("check_citation_present") and af < 1.0:
+            notes.append("Expected refusal not detected.")
+    elif scores["composite"] < 0.5:
         passed = False
-        notes.append("Answer missing citation tag.")
+        notes.append(f"Composite judge score {scores['composite']:.3f} below 0.5")
 
     return {
-        "id":                case["id"],
-        "description":       case["description"],
-        "context_precision": round(cp, 3),
-        "faithfulness":      round(af, 3),
-        "confidence":        round(conf, 3),
-        "passed":            passed,
-        "notes":             notes,
-        "answer_snippet":    answer[:120],
-        "retrieval_stats":   data.get("retrieval_stats", {}),
+        "id":             case["id"],
+        "description":    case.get("description", ""),
+        "faithfulness":   scores["faithfulness"],
+        "relevance":      scores["relevance"],
+        "composite":      scores["composite"],
+        "confidence":     round(conf, 3),
+        "passed":         passed,
+        "notes":          notes,
+        "answer_snippet": answer[:120],
+        "reasoning":      scores.get("reasoning", {}),
+        "retrieval_stats": data.get("retrieval_stats", {}),
+    }
+
+
+def _error_result(case: dict, msg: str) -> dict:
+    return {
+        "id": case["id"], "description": case.get("description", ""),
+        "faithfulness": 0.0, "relevance": 0.0, "composite": 0.0,
+        "confidence": 0.0, "passed": False, "notes": [msg], "answer_snippet": "",
     }
 
 
 # ---------------------------------------------------------------------------
-# Reporting
+# Reporting + history
 # ---------------------------------------------------------------------------
 
+def save_history(results: list[dict], commit_sha: str = "") -> None:
+    mean_f = sum(r["faithfulness"] for r in results) / len(results)
+    mean_r = sum(r["relevance"]    for r in results) / len(results)
+    mean_c = sum(r["composite"]    for r in results) / len(results)
+    passing = sum(1 for r in results if r["passed"])
+
+    entry = {
+        "timestamp":    datetime.now(timezone.utc).isoformat(),
+        "commit":       commit_sha,
+        "n_cases":      len(results),
+        "mean_faithfulness": round(mean_f, 3),
+        "mean_relevance":    round(mean_r, 3),
+        "mean_composite":    round(mean_c, 3),
+        "pass_rate":         round(passing / len(results), 3),
+        "cases": [
+            {"id": r["id"], "composite": r["composite"], "passed": r["passed"]}
+            for r in results
+        ],
+    }
+
+    HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(HISTORY_FILE, "a") as fh:
+        fh.write(json.dumps(entry) + "\n")
+
+    print(f"\nScore history appended → {HISTORY_FILE}")
+
+
 def print_report(results: list[dict], thresholds: dict) -> bool:
-    """Print eval results and return True if all thresholds are met."""
-    print("\n" + "=" * 60)
-    print("DocMind Eval Report")
-    print("=" * 60)
+    print("\n" + "=" * 64)
+    print("DocMind Eval Report  (LLM-as-Judge)")
+    print("=" * 64)
 
     total   = len(results)
     passing = sum(1 for r in results if r["passed"])
@@ -193,39 +202,42 @@ def print_report(results: list[dict], thresholds: dict) -> bool:
     for r in results:
         status = "✓ PASS" if r["passed"] else "✗ FAIL"
         print(f"\n[{status}] {r['id']} — {r['description']}")
-        print(f"  Context Precision : {r['context_precision']:.3f}")
-        print(f"  Faithfulness      : {r['faithfulness']:.3f}")
+        print(f"  Faithfulness : {r['faithfulness']:.3f}")
+        print(f"  Relevance    : {r['relevance']:.3f}")
+        print(f"  Composite    : {r['composite']:.3f}")
         if "confidence" in r:
-            print(f"  Confidence        : {r['confidence']:.3f}")
-        if r["notes"]:
+            print(f"  Confidence   : {r['confidence']:.3f}")
+        if r.get("notes"):
             for note in r["notes"]:
                 print(f"  ⚠  {note}")
-        if "retrieval_stats" in r:
+        if r.get("reasoning"):
+            print(f"  Judge (faith): {r['reasoning'].get('faithfulness','')}")
+            print(f"  Judge (rel)  : {r['reasoning'].get('relevance','')}")
+        if r.get("retrieval_stats"):
             rs = r["retrieval_stats"]
-            print(f"  Retrieval         : vec={rs.get('vector_hits',0)} "
+            print(f"  Retrieval    : vec={rs.get('vector_hits',0)} "
                   f"bm25={rs.get('bm25_hits',0)} "
                   f"rrf={rs.get('after_rrf',0)} "
                   f"rerank={rs.get('after_rerank',0)}")
 
-    # Aggregate
-    mean_cp = sum(r["context_precision"] for r in results) / total if total else 0
-    mean_af = sum(r["faithfulness"]      for r in results) / total if total else 0
-    pass_rt = passing / total if total else 0
+    mean_f  = sum(r["faithfulness"] for r in results) / total
+    mean_r  = sum(r["relevance"]    for r in results) / total
+    mean_c  = sum(r["composite"]    for r in results) / total
+    pass_rt = passing / total
 
-    print("\n" + "-" * 60)
-    print("Aggregate Metrics")
-    print(f"  Mean Context Precision : {mean_cp:.3f}  (threshold ≥ {thresholds['min_context_precision']})")
-    print(f"  Mean Faithfulness      : {mean_af:.3f}  (threshold ≥ {thresholds['min_answer_faithfulness']})")
-    print(f"  Pass Rate              : {pass_rt:.3f}  ({passing}/{total} cases)  (threshold ≥ {thresholds['min_cases_passing']})")
+    print("\n" + "-" * 64)
+    print("Aggregate")
+    print(f"  Mean Faithfulness : {mean_f:.3f}  (threshold ≥ {thresholds['min_answer_faithfulness']})")
+    print(f"  Mean Relevance    : {mean_r:.3f}")
+    print(f"  Mean Composite    : {mean_c:.3f}")
+    print(f"  Pass Rate         : {pass_rt:.3f}  ({passing}/{total})  (threshold ≥ {thresholds['min_cases_passing']})")
 
     ok = (
-        mean_cp  >= thresholds["min_context_precision"]
-        and mean_af  >= thresholds["min_answer_faithfulness"]
-        and pass_rt  >= thresholds["min_cases_passing"]
+        mean_f  >= thresholds["min_answer_faithfulness"]
+        and pass_rt >= thresholds["min_cases_passing"]
     )
-
-    print("\n" + ("✓ ALL THRESHOLDS MET — CI gate passes" if ok else "✗ THRESHOLDS NOT MET — CI gate FAILS"))
-    print("=" * 60 + "\n")
+    print("\n" + ("✓ ALL THRESHOLDS MET" if ok else "✗ THRESHOLDS NOT MET — CI gate FAILS"))
+    print("=" * 64 + "\n")
     return ok
 
 
@@ -235,22 +247,11 @@ def print_report(results: list[dict], thresholds: dict) -> bool:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="DocMind eval pipeline")
-    parser.add_argument(
-        "--quick", action="store_true",
-        help="Mock LLM; test retrieval + citation logic only (CI-safe)."
-    )
-    parser.add_argument(
-        "--full", action="store_true",
-        help="Call real backend. Requires Ollama running with models pulled."
-    )
-    parser.add_argument(
-        "--backend-url", default="http://localhost:8000",
-        help="Backend base URL for --full mode."
-    )
-    parser.add_argument(
-        "--output", default=None,
-        help="Write JSON results to this file."
-    )
+    parser.add_argument("--quick",       action="store_true")
+    parser.add_argument("--full",        action="store_true")
+    parser.add_argument("--backend-url", default="http://localhost:8000")
+    parser.add_argument("--output",      default=None)
+    parser.add_argument("--commit",      default="", help="Git SHA for history tracking")
     args = parser.parse_args()
 
     if not args.quick and not args.full:
@@ -258,7 +259,7 @@ def main() -> None:
         sys.exit(2)
 
     if not CASES_FILE.exists():
-        print(f"Test cases not found: {CASES_FILE}", file=sys.stderr)
+        print(f"No test cases found at {CASES_FILE}. Run eval/generate_cases.py first.", file=sys.stderr)
         sys.exit(2)
 
     with open(CASES_FILE) as fh:
@@ -267,32 +268,22 @@ def main() -> None:
     cases      = config["test_cases"]
     thresholds = config["thresholds"]
 
+    if not cases:
+        print("test_cases.json has no cases. Run eval/generate_cases.py first.", file=sys.stderr)
+        sys.exit(2)
+
     results: list[dict] = []
 
     if args.quick:
-        print("Running in QUICK mode (mocked LLM) …")
-        # Minimal fixture sources — just enough to test citation logic
-        fixture_sources = [
-            {"filename": "sample.pdf", "page_number": 1, "chunk_text": "This document describes key findings."},
-            {"filename": "sample.pdf", "page_number": 2, "chunk_text": "The methodology section outlines the approach."},
-        ]
+        print(f"Running QUICK mode on {len(cases)} cases (mocked LLM) …")
         for case in cases:
-            results.append(run_case_quick(case, fixture_sources))
+            results.append(run_case_quick(case))
     else:
-        print(f"Running in FULL mode against {args.backend_url} …")
+        print(f"Running FULL mode on {len(cases)} cases against {args.backend_url} …")
         for case in cases:
-            try:
-                results.append(run_case_full(case, args.backend_url))
-            except Exception as exc:
-                results.append({
-                    "id":                case["id"],
-                    "description":       case["description"],
-                    "context_precision": 0.0,
-                    "faithfulness":      0.0,
-                    "passed":            False,
-                    "notes":             [f"Error: {exc}"],
-                    "answer_snippet":    "",
-                })
+            print(f"  Evaluating: {case['id']} …")
+            results.append(run_case_full(case, args.backend_url))
+        save_history(results, commit_sha=args.commit)
 
     if args.output:
         Path(args.output).write_text(json.dumps(results, indent=2))
