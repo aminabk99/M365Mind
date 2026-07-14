@@ -4,6 +4,7 @@ from pydantic import BaseModel
 
 from backend.ingest import delete_document, get_chroma_collection, ingest_pdf
 from backend.retrieval import answer_question
+from monitoring.metrics import compute_metrics
 
 app = FastAPI(title="DocMind API", version="2.0.0")
 
@@ -96,3 +97,19 @@ async def delete_document_endpoint(doc_id: str):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Delete failed: {exc}") from exc
+
+
+# ---------------------------------------------------------------------------
+# GET /metrics
+# ---------------------------------------------------------------------------
+
+@app.get("/metrics")
+async def get_metrics(last_n: int = 1000):
+    """
+    Returns p50/p95/p99 latency, per-stage breakdown, token stats,
+    and quality metrics computed from the last N requests in traces.jsonl.
+    """
+    try:
+        return compute_metrics(last_n=last_n)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Metrics computation failed: {exc}") from exc

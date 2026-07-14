@@ -28,6 +28,7 @@ from backend.config import (
 )
 from backend.ingest import get_chroma_collection
 from backend.bm25_store import get_bm25_store
+from monitoring.tracer import Tracer, write_trace
 from backend.reranker import rerank
 
 # ---------------------------------------------------------------------------
@@ -160,6 +161,8 @@ def answer_question(
         }
     }
     """
+    tracer = Tracer()
+
     # ------------------------------------------------------------------
     # Guard: no documents
     # ------------------------------------------------------------------
@@ -181,7 +184,8 @@ def answer_question(
     # Step 1 — Vector search
     # ------------------------------------------------------------------
     n_vec = min(_RETRIEVAL_CANDIDATES, total)
-    query_embedding = _embed(question)
+    with tracer.span("embed"):
+        query_embedding = _embed(question)
 
     vec_kwargs: dict = dict(
         query_embeddings=[query_embedding],
@@ -191,7 +195,8 @@ def answer_question(
     if doc_ids:
         vec_kwargs["where"] = _doc_filter(doc_ids)
 
-    vec_results = collection.query(**vec_kwargs)
+    with tracer.span("vector_search"):
+        vec_results = collection.query(**vec_kwargs)
 
     vec_docs   = vec_results["documents"][0]
     vec_metas  = vec_results["metadatas"][0]
@@ -216,7 +221,8 @@ def answer_question(
     # Step 2 — BM25 search
     # ------------------------------------------------------------------
     bm25_store = get_bm25_store()
-    bm25_raw   = bm25_store.query(question, top_k=_RETRIEVAL_CANDIDATES)
+    with tracer.span("bm25"):
+        bm25_raw = bm25_store.query(question, top_k=_RETRIEVAL_CANDIDATES)
 
     # Filter to doc_ids scope if needed
     if doc_ids and bm25_raw:
@@ -257,8 +263,9 @@ def answer_question(
     # ------------------------------------------------------------------
     # Step 4 — Cross-encoder reranking
     # ------------------------------------------------------------------
-    actual_k  = min(top_k, len(candidates))
-    reranked  = rerank(question, candidates, top_k=actual_k)
+    actual_k = min(top_k, len(candidates))
+    with tracer.span("rerank"):
+        reranked = rerank(question, candidates, top_k=actual_k)
 
     # ------------------------------------------------------------------
     # Step 5 — Build prompt and call LLM
@@ -274,10 +281,11 @@ def answer_question(
     user_message = f"Context:\n{context_str}\n\nQuestion: {question}"
 
     llm = Ollama(model=LLM_MODEL, base_url=OLLAMA_BASE_URL, request_timeout=120.0)
-    response = llm.chat([
-        ChatMessage(role="system", content=SYSTEM_PROMPT),
-        ChatMessage(role="user",   content=user_message),
-    ])
+    with tracer.span("llm"):
+        response = llm.chat([
+            ChatMessage(role="system", content=SYSTEM_PROMPT),
+            ChatMessage(role="user",   content=user_message),
+        ])
     raw_answer = response.message.content
 
     # ------------------------------------------------------------------
@@ -293,7 +301,8 @@ def answer_question(
         for chunk in reranked
     ]
 
-    verified_answer = _verify_citations(raw_answer, sources)
+    with tracer.span("citation_check"):
+        verified_answer = _verify_citations(raw_answer, sources)
 
     # ------------------------------------------------------------------
     # Confidence: normalise mean rerank score to [0, 1] via sigmoid-like
@@ -306,6 +315,14 @@ def answer_question(
         confidence = round(max(0.0, min(1.0, (mean_logit + 10) / 20)), 4)
     else:
         confidence = 0.0
+
+    # ------------------------------------------------------------------
+    # Emit trace
+    # ------------------------------------------------------------------
+    tokens_generated = len(raw_answer.split())   # rough proxy
+    tokens_generated = len(raw_answer.split())   # rough proxy
+    write_trace(tracer.finish(), endpoint="/query", status="ok",
+                tokens_generated=tokens_generated, confidence=confidence)
 
     return {
         "answer": verified_answer,
