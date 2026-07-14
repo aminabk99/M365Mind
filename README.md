@@ -2,6 +2,8 @@
 
 A RAG-powered document intelligence web app that runs **fully locally** — no API keys, no cloud, no cost. Upload PDFs, ask natural-language questions, and get cited answers with confidence scores.
 
+Retrieval uses a **hybrid BM25 + vector search pipeline** with cross-encoder reranking and enforced source citations. A CI-gated eval suite runs on every push.
+
 ---
 
 ## Architecture
@@ -21,23 +23,28 @@ A RAG-powered document intelligence web app that runs **fully locally** — no A
 │                        LlamaIndex SimpleDirectoryReader         │
 │                        SentenceSplitter (512 tokens, 50 overlap)│
 │                        Ollama nomic-embed-text (embeddings)     │
-│                        ChromaDB .add()                          │
+│                        ChromaDB .add() + BM25 index rebuild     │
 │                                                                 │
 │  POST /query       ──► retrieval.py                             │
-│                        Ollama nomic-embed-text (embed question) │
-│                        ChromaDB cosine search (top-5)           │
-│                        Ollama llama3.2 (cited-answer prompt)    │
-│                        confidence = mean(cosine similarities)   │
+│                        ① Vector search  (ChromaDB, top-20)     │
+│                        ② BM25 search    (rank-bm25, top-20)    │
+│                        ③ RRF fusion     (k=60, top-15)         │
+│                        ④ Cross-encoder rerank (MiniLM, top-k)  │
+│                        ⑤ Ollama tinyllama (cited-answer prompt) │
+│                        ⑥ Citation enforcement (strip halluc.)  │
+│                        confidence = normalised mean rerank score│
 │                                                                 │
 │  GET  /documents   ──► list all uploaded docs                   │
-│  DELETE /documents/{id} ──► remove doc + chunks                 │
+│  DELETE /documents/{id} ──► remove doc + chunks + BM25 rebuild  │
 └────────────────────────────┬────────────────────────────────────┘
                              │
                              ▼
-              ┌──────────────────────────┐
-              │   ChromaDB (./chroma_db) │
-              │   Ollama (localhost:11434)│
-              └──────────────────────────┘
+              ┌──────────────────────────────────┐
+              │   ChromaDB      (./chroma_db)    │
+              │   BM25 index    (./chroma_db/    │
+              │                  bm25_index.pkl) │
+              │   Ollama        (localhost:11434) │
+              └──────────────────────────────────┘
 ```
 
 ---
@@ -49,7 +56,7 @@ A RAG-powered document intelligence web app that runs **fully locally** — no A
 Download from [ollama.com](https://ollama.com) and install it, then pull the required models:
 
 ```bash
-ollama pull llama3.2
+ollama pull tinyllama
 ollama pull nomic-embed-text
 ollama serve
 ```
@@ -120,11 +127,35 @@ docker-compose up --build
 {
   "answer": "The report concludes… [report.pdf, page 3]",
   "sources": [
-    {"filename": "report.pdf", "page_number": 3, "chunk_text": "…"}
+    {
+      "filename": "report.pdf",
+      "page_number": 3,
+      "chunk_text": "…",
+      "rerank_score": 4.821
+    }
   ],
-  "confidence": 0.847
+  "confidence": 0.847,
+  "retrieval_stats": {
+    "vector_hits": 20,
+    "bm25_hits": 14,
+    "after_rrf": 15,
+    "after_rerank": 5
+  }
 }
 ```
+
+---
+
+## Retrieval Pipeline
+
+| Stage | What happens |
+|-------|-------------|
+| ① Vector search | Question embedded with `nomic-embed-text`; top-20 chunks retrieved from ChromaDB by cosine similarity |
+| ② BM25 search | Same question searched against a persisted BM25Okapi index; top-20 chunks returned |
+| ③ RRF fusion | Both ranked lists merged with Reciprocal Rank Fusion (k=60); top-15 candidates selected |
+| ④ Cross-encoder rerank | `cross-encoder/ms-marco-MiniLM-L-6-v2` scores each candidate against the query; reranked to top-k |
+| ⑤ Generation | Cited-answer prompt sent to Ollama tinyllama with the reranked context |
+| ⑥ Citation enforcement | Any `[filename, page N]` tag not matching a retrieved source is stripped from the answer |
 
 ---
 
@@ -141,25 +172,40 @@ docker-compose up --build
 
 | Badge | Range | Meaning |
 |-------|-------|---------|
-| 🟢 High Confidence | ≥ 0.80 | Retrieved chunks are highly relevant |
+| 🟢 High Confidence | ≥ 0.80 | Cross-encoder scored retrieved chunks as highly relevant |
 | 🟡 Medium Confidence | 0.50 – 0.79 | Partial match; review sources |
 | 🔴 Low Confidence | < 0.50 | Weak match; answer may be unreliable |
 
 ---
 
+## Eval Pipeline
+
+```bash
+# Quick mode — mocked LLM, safe for CI
+python -m eval.run_evals --quick
+
+# Full mode — requires Ollama running with models pulled
+python -m eval.run_evals --full --backend-url http://localhost:8000
+```
+
+Metrics: **Context Precision**, **Answer Faithfulness**, **Pass Rate**. CI gates on all three thresholds via `.github/workflows/eval.yml`.
+
+---
+
 ## Note: Migrating from a previous version
 
-If you ran the OpenAI version and have an existing `chroma_db/` folder, delete it before starting — the embedding dimensions changed (OpenAI: 1536-dim → nomic-embed-text: 768-dim) and ChromaDB will reject the mismatch:
+If you have an existing `chroma_db/` folder from a previous version, delete it before starting:
 
 ```bash
 rm -rf chroma_db/
 ```
 
+The BM25 index (`chroma_db/bm25_index.pkl`) is rebuilt automatically on first ingest.
+
 ---
 
 ## Demo
 <img width="561" height="427" alt="DocMind Demo" src="https://github.com/user-attachments/assets/3853cdee-17ce-4b77-beb4-639db9bfce68" />
-
 
 ---
 
@@ -171,7 +217,10 @@ rm -rf chroma_db/
 | Backend | FastAPI + uvicorn |
 | Orchestration | LlamaIndex (load + chunk) |
 | Embeddings | Ollama nomic-embed-text |
-| LLM | Ollama llama3.2 |
+| Sparse retrieval | rank-bm25 (BM25Okapi) |
+| Reranking | sentence-transformers (MiniLM cross-encoder) |
+| LLM | Ollama tinyllama |
 | Vector DB | ChromaDB (persistent) |
 | HTTP client | httpx |
 | Containerization | Docker + docker-compose |
+| CI / Eval | GitHub Actions + custom eval pipeline |
