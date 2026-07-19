@@ -12,11 +12,16 @@ Model downloads automatically on first use (~270 MB, cached in
 from __future__ import annotations
 
 import logging
+import os
 from functools import lru_cache
 
 logger = logging.getLogger(__name__)
 
-_MODEL_NAME = "nomic-ai/nomic-embed-text-v1.5"
+# Env-configurable so you can swap in a smaller/faster embedder. Note: changing
+# this changes the vector dimension, so you must clear chroma_db and re-load
+# the demo. For ~3x faster embedding (Launch Demo) at a modest accuracy cost:
+#   M365_EMBED_MODEL=sentence-transformers/all-MiniLM-L6-v2
+_MODEL_NAME = os.getenv("M365_EMBED_MODEL", "nomic-ai/nomic-embed-text-v1.5")
 
 
 @lru_cache(maxsize=1)

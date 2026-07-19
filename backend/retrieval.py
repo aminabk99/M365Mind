@@ -35,7 +35,7 @@ _RETRIEVAL_CANDIDATES = 20
 _RRF_K = 60
 
 # How many candidates go into the cross-encoder after RRF
-_RERANK_CANDIDATES = 15
+_RERANK_CANDIDATES = int(__import__('os').getenv('M365_RERANK_CANDIDATES', '8'))
 
 SYSTEM_PROMPT = """You are M365Mind, an AI assistant for Microsoft 365 architects and IT administrators.
 You will be given policy context followed by a question. Answer clearly and specifically using only the information in the context.
@@ -304,7 +304,6 @@ def answer_question(
     # ------------------------------------------------------------------
     # Emit trace
     # ------------------------------------------------------------------
-    tokens_generated = len(raw_answer.split())   # rough proxy
     tokens_generated = len(raw_answer.split())   # rough proxy
     write_trace(tracer.finish(), endpoint="/query", status="ok",
                 tokens_generated=tokens_generated, confidence=confidence)

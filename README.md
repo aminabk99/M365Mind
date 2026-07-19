@@ -73,6 +73,34 @@ Click **Sign in with Microsoft** on the landing screen, then **Sync Policies** i
 
 ---
 
+## Performance
+
+The first query used to be slow because the embedding model, the cross-encoder
+reranker, and the Ollama LLM each load lazily on first use (tens of seconds
+cold). The app now **warms all three in a background thread at startup**, so the
+cost is paid while the page loads, not on your first click. The LLM is also kept
+resident in Ollama between requests (`keep_alive`), so an idle session doesn't
+pay a reload.
+
+Everything is tunable by environment variable — trade quality for speed without
+touching code:
+
+| Variable | Default | Faster setting |
+|----------|---------|----------------|
+| `M365_LLM_MODEL` | `qwen2.5:1.5b` | `qwen2.5:0.5b` — ~2x faster answers (run `ollama pull qwen2.5:0.5b` first) |
+| `M365_MAX_TOKENS` | `256` | lower (e.g. `160`) for shorter, quicker answers |
+| `M365_KEEP_ALIVE` | `30m` | keep the model resident longer/shorter |
+| `M365_EMBED_MODEL` | `nomic-ai/nomic-embed-text-v1.5` | `sentence-transformers/all-MiniLM-L6-v2` — ~3x faster embedding* |
+| `M365_RERANK_CANDIDATES` | `8` | fewer = faster rerank |
+
+\* Changing the embedding model changes the vector dimension, so clear
+`chroma_db/` and re-run **Launch Demo** once after switching.
+
+The dominant per-query cost is LLM generation on CPU (a few seconds). For the
+snappiest demo: `set M365_LLM_MODEL=qwen2.5:0.5b` before starting the backend.
+
+---
+
 ## Tech
 
 FastAPI · Streamlit · ChromaDB · BM25 (rank-bm25) · nomic-embed-text-v1.5 (sentence-transformers) · Qwen2.5-1.5B (Ollama) · MSAL · Microsoft Graph API

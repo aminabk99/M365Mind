@@ -18,6 +18,44 @@ app.add_middleware(
 )
 
 
+# ---------------------------------------------------------------------------
+# Startup warmup
+# ---------------------------------------------------------------------------
+# The embedding model, cross-encoder reranker, and Ollama LLM all load lazily
+# on first use — tens of seconds cold. Without warmup, the *user's* first
+# action (Launch Demo, or the first question) pays that entire cost, which is
+# why the app felt like it "took forever". Warming them in a background thread
+# at boot moves that cost off the request path: uvicorn starts immediately, the
+# models load while the page is still rendering, and the first real request is
+# fast. If a request arrives before warmup finishes it simply loads lazily as
+# before — never worse than the old behaviour.
+
+@app.on_event("startup")
+async def _warmup_models() -> None:
+    import threading, time
+
+    def _warm() -> None:
+        t0 = time.perf_counter()
+        try:
+            from backend.embeddings import embed
+            embed("warmup")                       # loads the embedding model
+        except Exception as exc:
+            print(f"[warmup] embedding warm failed: {exc}")
+        try:
+            from backend.reranker import rerank
+            rerank("warmup", [{"text": "warmup", "chunk_id": "w", "metadata": {}}], top_k=1)
+        except Exception as exc:
+            print(f"[warmup] reranker warm failed: {exc}")
+        try:
+            from backend.generation import prime
+            prime()                               # loads the LLM into Ollama memory
+        except Exception as exc:
+            print(f"[warmup] llm prime failed: {exc}")
+        print(f"[warmup] models warm in {time.perf_counter() - t0:.1f}s — first request will be fast.")
+
+    threading.Thread(target=_warm, name="model-warmup", daemon=True).start()
+
+
 class QueryRequest(BaseModel):
     question: str
     top_k: int = 5
