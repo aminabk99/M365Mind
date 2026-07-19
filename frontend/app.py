@@ -276,6 +276,24 @@ def load_demo_data() -> dict | None:
         return None
 
 
+def upload_files(files) -> list | None:
+    """Ingest user-uploaded PDFs via /upload. Returns list of {doc_id, filename, chunk_count}."""
+    results = []
+    try:
+        for f in files:
+            r = httpx.post(
+                f"{BACKEND_URL}/upload",
+                files={"file": (f.name, f.getvalue(), "application/pdf")},
+                timeout=300,
+            )
+            r.raise_for_status()
+            results.append(r.json())
+        return results
+    except Exception as exc:
+        st.error(f"Upload failed: {exc}")
+        return None
+
+
 def demo_already_loaded() -> bool:
     try:
         r = api_get("/demo/status")
@@ -429,32 +447,24 @@ with st.sidebar:
             st.session_state.demo_loaded = False
             st.rerun()
 
-    elif st.session_state.mode == "connected":
-        st.markdown('<span class="badge-connected">✓ Connected to M365</span>', unsafe_allow_html=True)
-        st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
-
-        if st.button("🔄 Sync Policies", use_container_width=True):
-            with st.spinner("Pulling policies from tenant…"):
-                result = sync_tenant(st.session_state.sid)
-            if result:
-                st.session_state.policies_info = [
-                    {"filename": p} for p in result.get("policies", [])
-                ]
-                st.toast(
-                    f"✓ {result['synced']} policies synced ({result['chunks']} chunks)",
-                    icon="🔷",
-                )
+    elif st.session_state.mode == "files":
+        st.markdown("**Your files**")
+        more = st.file_uploader("Add more PDFs", type=["pdf"], accept_multiple_files=True,
+                                label_visibility="collapsed", key="sidebar_upload")
+        if more and st.button("➕ Add files", use_container_width=True):
+            with st.spinner("Indexing…"):
+                res = upload_files(more)
+            if res:
+                st.session_state.policies_info += [{"filename": r["filename"]} for r in res]
                 st.rerun()
-
-        if st.button("↩ Disconnect", use_container_width=True):
+        if st.button("↩ Back to start", use_container_width=True):
             st.session_state.mode          = None
-            st.session_state.sid           = None
             st.session_state.messages      = []
             st.session_state.policies_info = []
             st.rerun()
 
     else:
-        st.caption("Not connected — choose a mode on the right")
+        st.caption("Not started — choose a mode on the right")
 
     if st.session_state.policies_info:
         st.divider()
@@ -491,7 +501,7 @@ if st.session_state.mode is None:
     st.markdown("---")
     st.markdown("#### Choose how to get started")
 
-    col_demo, col_connect = st.columns(2, gap="large")
+    col_demo, col_files = st.columns(2, gap="large")
 
     with col_demo:
         st.markdown("##### ⚡ Try it in 2 minutes")
@@ -500,6 +510,7 @@ if st.session_state.mode is None:
             "Conditional Access, Sensitivity Labels, Named Locations. "
             "No account, no setup, no waiting."
         )
+        st.caption("⏳ First run downloads a small model (~1 min). Instant after that.")
         if st.button("Launch Demo", type="primary", use_container_width=True):
             if demo_already_loaded():
                 st.session_state.mode = "demo"
@@ -517,20 +528,23 @@ if st.session_state.mode is None:
                     ]
                     st.rerun()
 
-    with col_connect:
-        st.markdown("##### 🏢 Connect your own tenant")
+    with col_files:
+        st.markdown("##### 📁 Try with your own files")
         st.markdown(
-            "Sign in with your Microsoft 365 work account to query your "
-            "**real tenant's** policies — Conditional Access, Sensitivity Labels, Named Locations."
+            "Upload your own policy exports or documents (PDF) and ask questions "
+            "about them. Nothing leaves your machine."
         )
-        if st.button("Sign in with Microsoft", type="secondary", use_container_width=True):
-            url = get_auth_url()
-            if url:
-                st.markdown(
-                    f'<meta http-equiv="refresh" content="0; url={url}">',
-                    unsafe_allow_html=True,
-                )
-                st.info("Redirecting to Microsoft login…")
+        uploaded = st.file_uploader(
+            "Upload PDFs", type=["pdf"], accept_multiple_files=True,
+            label_visibility="collapsed", key="landing_upload",
+        )
+        if uploaded and st.button("Use these files", type="secondary", use_container_width=True):
+            with st.spinner("Indexing your files… (first run downloads a small model, ~30s)"):
+                res = upload_files(uploaded)
+            if res:
+                st.session_state.mode = "files"
+                st.session_state.policies_info = [{"filename": r["filename"]} for r in res]
+                st.rerun()
 
     st.markdown("---")
 
@@ -548,7 +562,7 @@ if st.session_state.mode is None:
         )
 
     st.markdown(
-        "<small>Powered by Qwen2.5-1.5B via Ollama · nomic-embed-text · Hybrid RAG · "
+        "<small>Instant hybrid retrieval · MiniLM embeddings · optional Qwen2.5 summary (Ollama) · "
         "No telemetry · No cloud calls</small>",
         unsafe_allow_html=True,
     )
@@ -557,7 +571,7 @@ if st.session_state.mode is None:
 
 # ─── Main query interface ─────────────────────────────────────────────────────
 
-mode_label = "Demo" if st.session_state.mode == "demo" else "Your Tenant"
+mode_label = "Demo" if st.session_state.mode == "demo" else "Your Files"
 
 # ── Back button ───────────────────────────────────────────────────────────────
 if st.button("← Home", key="back_home"):

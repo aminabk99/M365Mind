@@ -38,7 +38,7 @@ def get_chroma_collection() -> chromadb.Collection:
 
 def ingest_pdf(file_bytes: bytes, original_filename: str) -> dict:
     """
-    Load a PDF, split into chunks, embed with sentence-transformers nomic-embed-text-v1.5,
+    Load a PDF, split into chunks, embed with the local sentence-transformers model (see backend/embeddings.py),
     store in ChromaDB, then rebuild the BM25 index.
 
     Returns {doc_id, filename, chunk_count}.

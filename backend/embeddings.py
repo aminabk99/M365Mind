@@ -1,9 +1,8 @@
 """
 Embedding module for M365Mind.
 
-Replaces Ollama nomic-embed-text with sentence-transformers.
-Uses the same underlying model (nomic-embed-text-v1.5) so existing
-ChromaDB collections remain compatible.
+Local embeddings via sentence-transformers. Defaults to all-MiniLM-L6-v2
+for fast CPU inference; override with M365_EMBED_MODEL.
 
 Model downloads automatically on first use (~270 MB, cached in
 ~/.cache/huggingface after that).
@@ -17,11 +16,14 @@ from functools import lru_cache
 
 logger = logging.getLogger(__name__)
 
-# Env-configurable so you can swap in a smaller/faster embedder. Note: changing
-# this changes the vector dimension, so you must clear chroma_db and re-load
-# the demo. For ~3x faster embedding (Launch Demo) at a modest accuracy cost:
-#   M365_EMBED_MODEL=sentence-transformers/all-MiniLM-L6-v2
-_MODEL_NAME = os.getenv("M365_EMBED_MODEL", "nomic-ai/nomic-embed-text-v1.5")
+# Default is all-MiniLM-L6-v2: ~80 MB, loads in a few seconds, embeds fast on
+# CPU. It replaced nomic-embed-text-v1.5 (~270 MB, ~50 s to load) because the
+# cold load was the single biggest source of "the app is slow" — for 17 short
+# policies the accuracy difference is negligible. Env-configurable; to go back
+# to the larger model set M365_EMBED_MODEL=nomic-ai/nomic-embed-text-v1.5.
+# Changing this changes the vector dimension, so clear chroma_db/ once and
+# re-load after switching.
+_MODEL_NAME = os.getenv("M365_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 
 
 @lru_cache(maxsize=1)

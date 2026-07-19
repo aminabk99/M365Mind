@@ -105,7 +105,7 @@ touching code:
 | `M365_LLM_MODEL` | `qwen2.5:1.5b` | `qwen2.5:0.5b` — ~2x faster answers (run `ollama pull qwen2.5:0.5b` first) |
 | `M365_MAX_TOKENS` | `256` | lower (e.g. `160`) for shorter, quicker answers |
 | `M365_KEEP_ALIVE` | `30m` | keep the model resident longer/shorter |
-| `M365_EMBED_MODEL` | `nomic-ai/nomic-embed-text-v1.5` | `sentence-transformers/all-MiniLM-L6-v2` — ~3x faster embedding* |
+| `M365_EMBED_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | `nomic-ai/nomic-embed-text-v1.5` — higher quality, ~10x slower to load* |
 | `M365_RERANK_CANDIDATES` | `8` | fewer = faster rerank |
 
 \* Changing the embedding model changes the vector dimension, so clear
@@ -118,4 +118,4 @@ snappiest demo: `set M365_LLM_MODEL=qwen2.5:0.5b` before starting the backend.
 
 ## Tech
 
-FastAPI · Streamlit · ChromaDB · BM25 (rank-bm25) · nomic-embed-text-v1.5 (sentence-transformers) · Qwen2.5-1.5B (Ollama) · MSAL · Microsoft Graph API
+FastAPI · Streamlit · ChromaDB · BM25 (rank-bm25) · all-MiniLM-L6-v2 (sentence-transformers) · Qwen2.5-1.5B (Ollama) · MSAL · Microsoft Graph API
